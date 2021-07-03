@@ -1,36 +1,258 @@
 """Implementation of a simple deterministic agent using Docker."""
-import numpy as np
-import torch
-from torch import nn
-from torch.nn import functional as F
-
+import pommerman
 from pommerman import agents
 from pommerman.runner import DockerAgentRunner
-from train import *
 
 import random
+
+
+import os
+from collections import namedtuple
+from itertools import count
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import nn, optim
+
+os.environ["KMP_DUPLsICATE_LIB_OK"] = "TRUE"
+
+Transition = namedtuple('Transition',
+                        ('state', 'action', 'next_state', 'reward'))
+reward_list = []
+
+class LinearBottleNeck(nn.Module):
+
+    def __init__(self, in_channels, out_channels, stride, t=6):
+        super().__init__()
+
+        layers = []
+
+        layers.append(nn.Conv2d(in_channels, in_channels * t, 1))
+        layers.append(nn.BatchNorm2d(in_channels * t))
+        layers.append(nn.ReLU6(inplace=True))
+
+
+        layers.append(nn.Conv2d(in_channels * t, out_channels, 1))
+
+        layers.append(nn.BatchNorm2d(out_channels))
+
+
+        self.residual = nn.Sequential(*layers)
+
+        self.stride = stride
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.t = t
+
+    def forward(self, x):
+
+        residual = self.residual(x)
+
+        if self.stride == 1 and self.in_channels == self.out_channels:
+            residual += x
+
+        return residual
+
+class ReplayMemory(object):
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = []
+        self.position = 0
+
+    def push(self, *args):
+        """Saves a transition."""
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
+        self.memory[self.position] = Transition(*args)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+
+    def __len__(self):
+        return len(self.memory)
+
+
+class Net(nn.Module):
+
+    def __init__(self):
+        super(Net, self).__init__()
+        self.nseq1 = nn.Sequential(
+            LinearBottleNeck(4, 4, 1, 1),
+            nn.Conv2d(4, 16, kernel_size=3),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            LinearBottleNeck(16, 16, 1, 1),
+            nn.Conv2d(16, 32, kernel_size=5),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+        #print(self.nseq1)
+        self.nseq2 = nn.Sequential(
+            nn.Linear(1740, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 256),
+            nn.ReLU(),
+            nn.Linear(256, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 6),
+        )
+
+    def forward(self, obs):
+        obs = obs.reshape((-1, 1464))
+        batch_size = obs.shape[0]
+        obs_board_cent = torch.cat([obs[:, :121], obs[:, 366:487], obs[:, 732:853], obs[:, 1098:1219]], dim=1).reshape(
+            (batch_size, 4, 11, 11))
+        obs_bbs_cent = torch.cat([obs[:, 121:242], obs[:, 487:608], obs[:, 853:974], obs[:, 1219:1340]], dim=1).reshape(
+            (batch_size, 4, 11, 11))
+        obs_bl_cent = torch.cat([obs[:, 242:363], obs[:, 608:729], obs[:, 974:1095], obs[:, 1340:1461]], dim=1).reshape(
+            (batch_size, 4, 11, 11))
+        obs_other = torch.cat([obs[:, 363:366], obs[:, 729:732], obs[:, 1095:1098], obs[:, 1461:]], dim=1)
+        #print(obs_other .shape)
+        cnn_output = torch.cat(
+            [self.nseq1(obs_board_cent).reshape(batch_size, -1), self.nseq1(obs_bbs_cent).reshape(batch_size, -1),
+             self.nseq1(obs_bl_cent).reshape(batch_size, -1)], dim=1)
+        #print(cnn_output .shape)
+        seq2_input = torch.cat([obs_other, cnn_output], dim=1)
+        # board = obs[:,:,:363].reshape((-1, 12,11,11))
+        # board = self.nseq1(board)
+        # board = board.reshape((obs.size(0), -1))
+        # print(board.shape)
+        # obs = torch.cat([board, obs[:, 363:366]], dim=1)
+        #print(seq2_input.shape)
+        #input()
+        return self.nseq2((seq2_input))
+
+
+class DQN(nn.Module):
+
+    def __init__(self):
+        super(DQN, self).__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.gamma = 0.999
+        self.obs_width = 11
+        self.lr = 0.001
+        self.batch_size = 256
+
+        self.policy_net = Net().to(self.device)
+        self.target_net = Net().to(self.device)
+        if os.path.exists("./model_good.pth"):
+            self.policy_net.load_state_dict(torch.load("model_good.pth", map_location='cpu'))
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+
+        self.memory = ReplayMemory(14000)
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=self.lr)
+
+    def learn(self):
+        if len(self.memory) < self.batch_size:
+            return
+        transitions = self.memory.sample(self.batch_size)
+        batch = Transition(*zip(*transitions))
+        # policy net
+        state_batch = torch.cat(batch.state).float()
+        action_batch = torch.cat(batch.action).reshape((self.batch_size, -1))
+
+        state_action_values = self.policy_net(state_batch).gather(dim=0, index=action_batch)
+        state_action_values = state_action_values.reshape(self.batch_size)
+
+        # target net
+        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)), device=self.device,
+                                      dtype=torch.bool)
+        non_final_next_states = torch.cat([s for s in batch.next_state
+                                           if s is not None]).float()
+        next_state_values = torch.zeros(self.batch_size, device=self.device)
+        next_state_values[non_final_mask] = self.target_net(non_final_next_states).max(1)[0].detach()
+        reward_batch = torch.cat(batch.reward)
+        expected_state_action_values = (next_state_values * self.gamma) + reward_batch
+        # print(expected_state_action_values)
+        # calculate Q value loss
+        loss = F.smooth_l1_loss(state_action_values, expected_state_action_values)
+        # global writer
+        global global_step
+
+        # writer.add_scalar("reward", torch.mean(expected_state_action_values).item(), global_step)
+        # writer.add_scalar("loss", loss.item(), global_step)
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        for param in self.policy_net.parameters():
+            if param.grad is None:
+                print(param, "============", sep="\n")
+            else:
+                param.grad.data.clamp_(-1, 1)
+        self.optimizer.step()
+
 
 class MyAgent(DockerAgentRunner):
     '''An example Docker agent class'''
 
     def __init__(self):
         self.model = DQN().to(device)
-        import os
         if os.path.exists("./model_good.pth"):
             self.model = torch.load("model_good.pth", map_location='cpu')
-        self._agent = agents.SimpleAgent()
+        self.random = agents.SimpleAgent()
+        self.obs_fps = [torch.zeros(366, device=self.model.device), torch.zeros(366, device=self.model.device),
+                        torch.zeros(366, device=self.model.device)]
+
+    def translate_obs(self, o):
+        obs_width = self.model.obs_width
+
+        board = o['board'].copy()
+        agents = np.column_stack(np.where(board > 10))
+
+        for i, agent in enumerate(agents):
+            agent_id = board[agent[0], agent[1]]
+            if agent_id not in o['alive']:  # < this fixes a bug >
+                board[agent[0], agent[1]] = 0
+            else:
+                board[agent[0], agent[1]] = 11
+
+        obs_radius = obs_width // 2
+        pos = np.asarray(o['position'])
+
+        # board
+        board_pad = np.pad(board, (obs_radius, obs_radius), 'constant', constant_values=1)
+        self.board_cent = board_cent = board_pad[pos[0]:pos[0] + 2 * obs_radius + 1, pos[1]:pos[1] + 2 * obs_radius + 1]
+
+        # bomb blast strength
+        bbs = o['bomb_blast_strength']
+        bbs_pad = np.pad(bbs, (obs_radius, obs_radius), 'constant', constant_values=0)
+        self.bbs_cent = bbs_cent = bbs_pad[pos[0]:pos[0] + 2 * obs_radius + 1, pos[1]:pos[1] + 2 * obs_radius + 1]
+
+        # bomb life
+        bl = o['bomb_life']
+        bl_pad = np.pad(bl, (obs_radius, obs_radius), 'constant', constant_values=0)
+        self.bl_cent = bl_cent = bl_pad[pos[0]:pos[0] + 2 * obs_radius + 1, pos[1]:pos[1] + 2 * obs_radius + 1]
+
+        return np.concatenate((
+            board_cent, bbs_cent, bl_cent,
+            o['blast_strength'], o['can_kick'], o['ammo']), axis=None)
 
     def act(self, observation, action_space):
         obs = self.translate_obs(observation)
-        obs = torch.from_numpy(obs).float().to(self.device)
+        obs = torch.from_numpy(obs).float().to(self.model.device)
         self.obs_fps.append(obs)
         obs = torch.cat(self.obs_fps[-4:])
         sample = random.random()
-        if sample > 0.1:
-            re_action = self.model(obs).argmax().item()
+        if sample > 1000.0 / (global_step + 0.1):
+            re_action = self.model.policy_net(obs).argmax().item()
             return re_action
         else:
-            return self._agent.act(observation, action_space)
+            return self.random.act(observation, action_space)
+
+    def episode_end(self, reward):
+        global reward_list
+        reward_list.append(reward)
+
 
 def main():
     '''Inits and runs a Docker Agent'''
