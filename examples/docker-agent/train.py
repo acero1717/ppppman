@@ -8,14 +8,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import nn, optim
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 
 import pommerman
 from pommerman import agents
 from pommerman.runner import DockerAgentRunner
 
-writer = SummaryWriter("./log_2/")
-global_step = 0
+# writer = SummaryWriter("./log_2/")
+# global_step = 0
 
 os.environ["KMP_DUPLsICATE_LIB_OK"] = "TRUE"
 
@@ -146,8 +146,8 @@ class DQN(nn.Module):
 
         self.policy_net = Net().to(self.device)
         self.target_net = Net().to(self.device)
-        if os.path.exists("model_good.pth"):
-            self.policy_net.load_state_dict(torch.load("model_good.pth"))
+        if os.path.exists("./model_good.pth"):
+            self.policy_net.load_state_dict(torch.load("model_good.pth", map_location='cpu'))
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
 
@@ -178,11 +178,11 @@ class DQN(nn.Module):
         # print(expected_state_action_values)
         # calculate Q value loss
         loss = F.smooth_l1_loss(state_action_values, expected_state_action_values)
-        global writer
+        # global writer
         global global_step
 
-        writer.add_scalar("reward", torch.mean(expected_state_action_values).item(), global_step)
-        writer.add_scalar("loss", loss.item(), global_step)
+        # writer.add_scalar("reward", torch.mean(expected_state_action_values).item(), global_step)
+        # writer.add_scalar("loss", loss.item(), global_step)
 
         self.optimizer.zero_grad()
         loss.backward()
